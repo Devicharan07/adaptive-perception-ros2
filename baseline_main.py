@@ -51,6 +51,8 @@ class BaselinePerceptionNode(Node):
         self.dist_coeffs = None
         self.frame_counter = 0
         self.last_frame_time = None
+        self.last_header_time = None
+        self.raw_miss_count = 0
         self.use_subpix_last = False  # Synchronized subpix decision buffer from previous frame
 
         # ROS Communications (Identical Topics)
@@ -79,13 +81,20 @@ class BaselinePerceptionNode(Node):
             with open(self.csv_path, mode='w', newline='') as f:
                 writer = csv.writer(f)
                 writer.writerow([
-                    'frame_id', 'timestamp', 'detection_success', 'pose_success', 'confidence', 
-                    'latency_ms', 'mode', 'alpha', 'scale', 'subpix', 'streak', 
+                    'frame_id', 'timestamp', 'detection_success', 'pose_success', 'confidence',
+                    'latency_ms', 'latency_derived_fps', 'callback_interval_ms', 'callback_rate_hz', 'header_rate_hz',
+                    'mode_used', 'alpha_used', 'scale_used', 'subpix_used',
+                    'mode_next', 'alpha_next', 'scale_next', 'subpix_next', 'streak_next',
                     'marker_x', 'marker_y', 'marker_size_px',
-                    'fps', 'cpu_percent', 'memory_percent', 'roi_switch', 
-                    'miss_count', 'marker_area_px', 'bbox_width_px', 'bbox_height_px',
-                    'pipeline_mode',
-                    'roi_x', 'roi_y', 'roi_width', 'roi_height'
+                    'raw_miss_start', 'raw_miss_count', 'raw_reacquisition_event', 'raw_frames_to_reacquire',
+                    'adaptive_reset_event', 'controller_miss_count',
+                    'marker_area_px', 'bbox_width_px', 'bbox_height_px',
+                    'roi_x_used', 'roi_y_used', 'roi_width_used', 'roi_height_used',
+                    'detector_input_width', 'detector_input_height', 'detector_input_pixels',
+                    'decode_convert_ms', 'roi_compute_ms', 'crop_ms', 'resize_ms', 'detector_ms',
+                    'subpix_ms', 'confidence_ms', 'controller_ms', 'pose_ms',
+                    'cpu_user_ms', 'cpu_system_ms', 'cpu_total_ms', 'process_cpu_util_pct', 'rss_mb',
+                    'pipeline_mode'
                 ])
             self.get_logger().info(f"Logging baseline experiment to: {self.csv_path}")
 
@@ -97,19 +106,30 @@ class BaselinePerceptionNode(Node):
             self.dist_coeffs = np.array(msg.d, dtype=np.float32)
 
     def image_callback(self, msg: Image):
-        current_time = time.time()
+        current_time = time.perf_counter()
         self.frame_counter += 1
-        
-        # Calculate instantaneous FPS
-        fps = 0.0
+
+        callback_interval_ms = 0.0
+        callback_rate_hz = 0.0
         if self.last_frame_time is not None:
             time_delta = current_time - self.last_frame_time
             if time_delta > 0:
-                fps = 1.0 / time_delta
+                callback_interval_ms = time_delta * 1000.0
+                callback_rate_hz = 1.0 / time_delta
         self.last_frame_time = current_time
 
+        header_time = msg.header.stamp.sec + (msg.header.stamp.nanosec * 1e-9)
+        header_rate_hz = 0.0
+        if self.last_header_time is not None:
+            header_delta = header_time - self.last_header_time
+            if header_delta > 0:
+                header_rate_hz = 1.0 / header_delta
+        self.last_header_time = header_time
+
+        cpu_times_start = self.process.cpu_times()
         self.profiler.start()
 
+        self.profiler.start_stage('decode_convert')
         try:
             if msg.encoding == 'rgb8':
                 cv_img = self.bridge.imgmsg_to_cv2(msg, desired_encoding='rgb8')
@@ -119,18 +139,37 @@ class BaselinePerceptionNode(Node):
         except CvBridgeError as e:
             self.get_logger().error(f"CvBridge Error: {e}")
             return
+        self.profiler.stop_stage('decode_convert')
 
         # 1. Stage 1: Full Image Processing Input (Fixed Scale = 1.0)
         input_image = cv_img
         img_h, img_w = cv_img.shape[:2]
 
-        roi_x = 0
-        roi_y = 0
-        roi_width = int(img_w)
-        roi_height = int(img_h)
+        mode_used = "FULL_IMAGE"
+        alpha_used = 2.0
+        scale_used = 1.0
+        roi_x_used = 0
+        roi_y_used = 0
+        roi_width_used = int(img_w)
+        roi_height_used = int(img_h)
+        detector_input_height, detector_input_width = input_image.shape[:2]
+        detector_input_pixels = detector_input_width * detector_input_height
 
         # 2. Perception Detection
+        self.profiler.start_stage('detector')
         success, corners, ids = self.detector_module.detect(input_image)
+        self.profiler.stop_stage('detector')
+        raw_miss_start = 0
+        raw_reacquisition_event = 0
+        raw_frames_to_reacquire = 0
+        if success:
+            if self.raw_miss_count > 0:
+                raw_reacquisition_event = 1
+                raw_frames_to_reacquire = self.raw_miss_count
+            self.raw_miss_count = 0
+        else:
+            raw_miss_start = int(self.raw_miss_count == 0)
+            self.raw_miss_count += 1
         if success and corners is not None:
             corners = list(corners)
 
@@ -156,50 +195,65 @@ class BaselinePerceptionNode(Node):
         subpix_applied_this_frame = False
         if success and self.use_subpix_last and primary_corners is not None:
             subpix_applied_this_frame = True
+            self.profiler.start_stage('subpix')
             gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
             criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.01)
             pts = np.squeeze(primary_corners).astype(np.float32)
             refined_pts = cv2.cornerSubPix(gray, pts, (5, 5), (-1, -1), criteria)
             primary_corners = refined_pts.reshape(1, 4, 2)
             corners[0] = primary_corners
+            self.profiler.stop_stage('subpix')
+        subpix_used = subpix_applied_this_frame
 
         # 4. Continuous Confidence Calculation
+        self.profiler.start_stage('confidence')
         confidence = self.confidence_evaluator.compute_confidence(corners, cv_img.shape)
+        self.profiler.stop_stage('confidence')
 
         # 5. Update SubPix decision buffer for the NEXT frame (Matching adaptive controller timing)
+        self.profiler.start_stage('controller')
         if confidence < self.SUBPIX_CONFIDENCE:
             self.use_subpix_last = True
         else:
             self.use_subpix_last = False
+        self.profiler.stop_stage('controller')
 
         # 6. Pose Estimation (Identical)
         pose_success = False
         rvec, tvec, quat = None, None, None
+        self.profiler.start_stage('pose')
         if success and self.camera_matrix is not None:
             pose_success, rvec, tvec, quat = self.pose_estimator.estimate(
                 corners, self.camera_matrix, self.dist_coeffs, self.marker_length
             )
+        self.profiler.stop_stage('pose')
 
-            if pose_success and quat is not None:
-                pose_msg = PoseStamped()
-                pose_msg.header = msg.header
-                
-                tvec_flat = np.array(tvec, dtype=np.float64).flatten()
-                quat_flat = np.array(quat, dtype=np.float64).flatten()
+        if pose_success and quat is not None:
+            pose_msg = PoseStamped()
+            pose_msg.header = msg.header
 
-                pose_msg.pose.position.x = tvec_flat[0]
-                pose_msg.pose.position.y = tvec_flat[1]
-                pose_msg.pose.position.z = tvec_flat[2]
+            tvec_flat = np.array(tvec, dtype=np.float64).flatten()
+            quat_flat = np.array(quat, dtype=np.float64).flatten()
 
-                pose_msg.pose.orientation.x = quat_flat[0]
-                pose_msg.pose.orientation.y = quat_flat[1]
-                pose_msg.pose.orientation.z = quat_flat[2]
-                pose_msg.pose.orientation.w = quat_flat[3]
+            pose_msg.pose.position.x = tvec_flat[0]
+            pose_msg.pose.position.y = tvec_flat[1]
+            pose_msg.pose.position.z = tvec_flat[2]
 
-                self.pub_pose.publish(pose_msg)
+            pose_msg.pose.orientation.x = quat_flat[0]
+            pose_msg.pose.orientation.y = quat_flat[1]
+            pose_msg.pose.orientation.z = quat_flat[2]
+            pose_msg.pose.orientation.w = quat_flat[3]
+
+            self.pub_pose.publish(pose_msg)
 
         # 7. Profiling & Telemetry
         latency_ms = self.profiler.stop()
+        cpu_times_end = self.process.cpu_times()
+        cpu_user_ms = (cpu_times_end.user - cpu_times_start.user) * 1000.0
+        cpu_system_ms = (cpu_times_end.system - cpu_times_start.system) * 1000.0
+        cpu_total_ms = cpu_user_ms + cpu_system_ms
+        process_cpu_util_pct = (100.0 * cpu_total_ms / latency_ms) if latency_ms > 0 else 0.0
+        latency_derived_fps = (1000.0 / latency_ms) if latency_ms > 0 else 0.0
 
         lat_msg = Float32(data=latency_ms)
         self.pub_latency.publish(lat_msg)
@@ -209,9 +263,8 @@ class BaselinePerceptionNode(Node):
 
         # 8. CSV Logging Step (Identical Schema + ROI Dimensions)
         if ENABLE_CSV_LOG and self.csv_path:
-            ts = msg.header.stamp.sec + (msg.header.stamp.nanosec * 1e-9)
-            cpu_pct = self.process.cpu_percent(interval=None)
-            mem_pct = self.process.memory_percent()
+            ts = header_time
+            rss_mb = self.process.memory_info().rss / (1024.0 * 1024.0)
 
             with open(self.csv_path, mode='a', newline='') as f:
                 writer = csv.writer(f)
@@ -222,27 +275,53 @@ class BaselinePerceptionNode(Node):
                     int(pose_success),
                     f"{confidence:.3f}",
                     f"{latency_ms:.2f}",
+                    f"{latency_derived_fps:.2f}",
+                    f"{callback_interval_ms:.2f}",
+                    f"{callback_rate_hz:.2f}",
+                    f"{header_rate_hz:.2f}",
                     "FULL_IMAGE",
                     "2.00",
                     "1.0",
                     int(subpix_applied_this_frame),
+                    "FULL_IMAGE",
+                    "2.00",
+                    "1.0",
+                    int(self.use_subpix_last),
                     0,  # streak = 0
                     f"{marker_x:.1f}",
                     f"{marker_y:.1f}",
                     f"{marker_size_px:.1f}",
-                    f"{fps:.2f}",
-                    f"{cpu_pct:.1f}",
-                    f"{mem_pct:.2f}",
-                    0,  # roi_switch = 0
+                    raw_miss_start,
+                    self.raw_miss_count,
+                    raw_reacquisition_event,
+                    raw_frames_to_reacquire,
                     0,  # miss_count = 0
+                    0,  # controller_miss_count = 0
                     f"{marker_area_px:.1f}",
                     f"{bbox_width_px:.1f}",
                     f"{bbox_height_px:.1f}",
-                    "BASELINE",
-                    roi_x,
-                    roi_y,
-                    roi_width,
-                    roi_height
+                    roi_x_used,
+                    roi_y_used,
+                    roi_width_used,
+                    roi_height_used,
+                    detector_input_width,
+                    detector_input_height,
+                    detector_input_pixels,
+                    f"{self.profiler.stage_ms('decode_convert'):.2f}",
+                    f"{self.profiler.stage_ms('roi_compute'):.2f}",
+                    f"{self.profiler.stage_ms('crop'):.2f}",
+                    f"{self.profiler.stage_ms('resize'):.2f}",
+                    f"{self.profiler.stage_ms('detector'):.2f}",
+                    f"{self.profiler.stage_ms('subpix'):.2f}",
+                    f"{self.profiler.stage_ms('confidence'):.2f}",
+                    f"{self.profiler.stage_ms('controller'):.2f}",
+                    f"{self.profiler.stage_ms('pose'):.2f}",
+                    f"{cpu_user_ms:.2f}",
+                    f"{cpu_system_ms:.2f}",
+                    f"{cpu_total_ms:.2f}",
+                    f"{process_cpu_util_pct:.2f}",
+                    f"{rss_mb:.2f}",
+                    "BASELINE"
                 ])
 
         # 9. Debug Visualization
