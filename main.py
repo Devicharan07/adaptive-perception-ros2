@@ -8,6 +8,7 @@ import cv2
 import numpy as np
 import psutil
 import rclpy
+from scipy.spatial.transform import Rotation as R
 from rclpy.node import Node
 from sensor_msgs.msg import Image, CameraInfo
 from geometry_msgs.msg import PoseStamped
@@ -58,6 +59,9 @@ class MainPerceptionNode(Node):
         self.last_header_time = None
         self.raw_miss_count = 0
         self.previous_mode = "FULL_IMAGE"
+        # Telemetry-only state: prevents repeated reset events during one
+        # uninterrupted controller detection-failure interval.
+        self.adaptive_loss_reset_active = False
 
         # ROS Communications
         self.sub_image = self.create_subscription(
@@ -85,11 +89,14 @@ class MainPerceptionNode(Node):
             with open(self.csv_path, mode='w', newline='') as f:
                 writer = csv.writer(f)
                 writer.writerow([
-                    'frame_id', 'timestamp', 'detection_success', 'pose_success', 'confidence',
+                    'frame_id', 'timestamp', 'detection_success', 'pose_success',
+                    'pose_x_m', 'pose_y_m', 'pose_z_m',
+                    'pose_roll_deg', 'pose_pitch_deg', 'pose_yaw_deg', 'pose_distance_m',
+                    'confidence',
                     'latency_ms', 'latency_derived_fps', 'callback_interval_ms', 'callback_rate_hz', 'header_rate_hz',
                     'mode_used', 'alpha_used', 'scale_used', 'subpix_used',
                     'mode_next', 'alpha_next', 'scale_next', 'subpix_next', 'streak_next',
-                    'marker_x', 'marker_y', 'marker_size_px',
+                    'marker_x', 'marker_y', 'marker_center_offset_px', 'marker_size_px',
                     'raw_miss_start', 'raw_miss_count', 'raw_reacquisition_event', 'raw_frames_to_reacquire',
                     'adaptive_reset_event', 'controller_miss_count',
                     'marker_area_px', 'bbox_width_px', 'bbox_height_px',
@@ -256,7 +263,7 @@ class MainPerceptionNode(Node):
         if not controller_detection_failure:
             controller_pts = np.squeeze(primary_corners)
             controller_detection_failure = controller_pts.ndim != 2 or controller_pts.shape[0] < 4
-        adaptive_reset_event = int(
+        controller_reset_triggered = (
             controller_detection_failure and
             self.controller.miss_count + 1 >= self.controller.MISS_TOLERANCE
         )
@@ -269,6 +276,18 @@ class MainPerceptionNode(Node):
         )
         self.profiler.stop_stage('controller')
         self.roi_manager.alpha = control_state["alpha"]
+
+        # A reset event is the transition into a loss/reset interval, not each
+        # later threshold crossing while that same detection failure continues.
+        adaptive_reset_event = int(
+            controller_reset_triggered and not self.adaptive_loss_reset_active
+        )
+        if controller_reset_triggered:
+            self.adaptive_loss_reset_active = True
+        elif not controller_detection_failure and confidence >= self.controller.min_confidence:
+            # Low-confidence observations intentionally hold controller state,
+            # so only a controller-accepted observation re-arms this event.
+            self.adaptive_loss_reset_active = False
 
         # Track Mode Switch for telemetry
         roi_switch = 1 if control_state["mode"] != self.previous_mode else 0
@@ -317,6 +336,28 @@ class MainPerceptionNode(Node):
         latency_derived_fps = (1000.0 / latency_ms) if latency_ms > 0 else 0.0
         self.last_latency_ms = latency_ms
 
+        # Telemetry is derived from the existing pose result after the official
+        # latency boundary; no additional pose solve or projection is performed.
+        pose_x_m = pose_y_m = pose_z_m = -1.0
+        pose_roll_deg = pose_pitch_deg = pose_yaw_deg = -1.0
+        pose_distance_m = -1.0
+        if pose_success and tvec is not None and quat is not None:
+            tvec_flat = np.asarray(tvec, dtype=np.float64).reshape(-1)
+            quat_flat = np.asarray(quat, dtype=np.float64).reshape(-1)
+            if tvec_flat.size >= 3 and quat_flat.size >= 4:
+                pose_x_m, pose_y_m, pose_z_m = (float(value) for value in tvec_flat[:3])
+                # SciPy lowercase 'xyz': extrinsic rotations about fixed X, Y, Z.
+                pose_roll_deg, pose_pitch_deg, pose_yaw_deg = R.from_quat(
+                    quat_flat[:4]
+                ).as_euler('xyz', degrees=True)
+                pose_distance_m = float(np.linalg.norm(tvec_flat[:3]))
+
+        marker_center_offset_px = -1.0
+        if marker_x >= 0.0 and marker_y >= 0.0:
+            marker_center_offset_px = float(np.hypot(
+                marker_x - (img_w / 2.0), marker_y - (img_h / 2.0)
+            ))
+
         lat_msg = Float32(data=latency_ms)
         self.pub_latency.publish(lat_msg)
 
@@ -334,9 +375,16 @@ class MainPerceptionNode(Node):
                 writer = csv.writer(f)
                 writer.writerow([
                     self.frame_counter,
-                    f"{ts:.4f}",
+                    f"{header_time:.4f}",
                     int(success),
                     int(pose_success),
+                    f"{pose_x_m:.6f}",
+                    f"{pose_y_m:.6f}",
+                    f"{pose_z_m:.6f}",
+                    f"{pose_roll_deg:.3f}",
+                    f"{pose_pitch_deg:.3f}",
+                    f"{pose_yaw_deg:.3f}",
+                    f"{pose_distance_m:.6f}",
                     f"{confidence:.3f}",
                     f"{latency_ms:.2f}",
                     f"{latency_derived_fps:.2f}",
@@ -354,6 +402,7 @@ class MainPerceptionNode(Node):
                     control_state['streak'],
                     f"{marker_x:.1f}",
                     f"{marker_y:.1f}",
+                    f"{marker_center_offset_px:.1f}",
                     f"{marker_size_px:.1f}",
                     raw_miss_start,
                     self.raw_miss_count,

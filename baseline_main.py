@@ -8,6 +8,7 @@ import cv2
 import numpy as np
 import psutil
 import rclpy
+from scipy.spatial.transform import Rotation as R
 from rclpy.node import Node
 from sensor_msgs.msg import Image, CameraInfo
 from geometry_msgs.msg import PoseStamped
@@ -81,11 +82,14 @@ class BaselinePerceptionNode(Node):
             with open(self.csv_path, mode='w', newline='') as f:
                 writer = csv.writer(f)
                 writer.writerow([
-                    'frame_id', 'timestamp', 'detection_success', 'pose_success', 'confidence',
+                    'frame_id', 'timestamp', 'detection_success', 'pose_success',
+                    'pose_x_m', 'pose_y_m', 'pose_z_m',
+                    'pose_roll_deg', 'pose_pitch_deg', 'pose_yaw_deg', 'pose_distance_m',
+                    'confidence',
                     'latency_ms', 'latency_derived_fps', 'callback_interval_ms', 'callback_rate_hz', 'header_rate_hz',
                     'mode_used', 'alpha_used', 'scale_used', 'subpix_used',
                     'mode_next', 'alpha_next', 'scale_next', 'subpix_next', 'streak_next',
-                    'marker_x', 'marker_y', 'marker_size_px',
+                    'marker_x', 'marker_y', 'marker_center_offset_px', 'marker_size_px',
                     'raw_miss_start', 'raw_miss_count', 'raw_reacquisition_event', 'raw_frames_to_reacquire',
                     'adaptive_reset_event', 'controller_miss_count',
                     'marker_area_px', 'bbox_width_px', 'bbox_height_px',
@@ -255,6 +259,28 @@ class BaselinePerceptionNode(Node):
         process_cpu_util_pct = (100.0 * cpu_total_ms / latency_ms) if latency_ms > 0 else 0.0
         latency_derived_fps = (1000.0 / latency_ms) if latency_ms > 0 else 0.0
 
+        # Telemetry is derived from the existing pose result after the official
+        # latency boundary; no additional pose solve or projection is performed.
+        pose_x_m = pose_y_m = pose_z_m = -1.0
+        pose_roll_deg = pose_pitch_deg = pose_yaw_deg = -1.0
+        pose_distance_m = -1.0
+        if pose_success and tvec is not None and quat is not None:
+            tvec_flat = np.asarray(tvec, dtype=np.float64).reshape(-1)
+            quat_flat = np.asarray(quat, dtype=np.float64).reshape(-1)
+            if tvec_flat.size >= 3 and quat_flat.size >= 4:
+                pose_x_m, pose_y_m, pose_z_m = (float(value) for value in tvec_flat[:3])
+                # SciPy lowercase 'xyz': extrinsic rotations about fixed X, Y, Z.
+                pose_roll_deg, pose_pitch_deg, pose_yaw_deg = R.from_quat(
+                    quat_flat[:4]
+                ).as_euler('xyz', degrees=True)
+                pose_distance_m = float(np.linalg.norm(tvec_flat[:3]))
+
+        marker_center_offset_px = -1.0
+        if marker_x >= 0.0 and marker_y >= 0.0:
+            marker_center_offset_px = float(np.hypot(
+                marker_x - (img_w / 2.0), marker_y - (img_h / 2.0)
+            ))
+
         lat_msg = Float32(data=latency_ms)
         self.pub_latency.publish(lat_msg)
 
@@ -273,6 +299,13 @@ class BaselinePerceptionNode(Node):
                     f"{ts:.4f}",
                     int(success),
                     int(pose_success),
+                    f"{pose_x_m:.6f}",
+                    f"{pose_y_m:.6f}",
+                    f"{pose_z_m:.6f}",
+                    f"{pose_roll_deg:.3f}",
+                    f"{pose_pitch_deg:.3f}",
+                    f"{pose_yaw_deg:.3f}",
+                    f"{pose_distance_m:.6f}",
                     f"{confidence:.3f}",
                     f"{latency_ms:.2f}",
                     f"{latency_derived_fps:.2f}",
@@ -290,6 +323,7 @@ class BaselinePerceptionNode(Node):
                     0,  # streak = 0
                     f"{marker_x:.1f}",
                     f"{marker_y:.1f}",
+                    f"{marker_center_offset_px:.1f}",
                     f"{marker_size_px:.1f}",
                     raw_miss_start,
                     self.raw_miss_count,
