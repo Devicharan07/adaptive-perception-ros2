@@ -1,5 +1,23 @@
 #!/usr/bin/env python3
 
+# --- DIAGNOSTIC OVERRIDES ---
+# Set both to None to preserve normal Prototype 1 adaptive behavior.
+FORCED_SCALE = None
+FORCED_ROI = None  #Options: None, True, False
+
+if (
+    FORCED_SCALE is not None
+    and (
+        isinstance(FORCED_SCALE, bool)
+        or not isinstance(FORCED_SCALE, (int, float))
+        or FORCED_SCALE not in (1.0, 0.5, 0.25, 0.6)
+    )
+):
+    raise ValueError("FORCED_SCALE must be None, 1.0, 0.5, 0.25, or 0.6")
+
+if FORCED_ROI is not None and not isinstance(FORCED_ROI, bool):
+    raise ValueError("FORCED_ROI must be None, True, or False")
+
 import os
 import csv
 import time
@@ -25,7 +43,6 @@ from adaptive_perception.roi import ROIManager
 # --- EVALUATION LOGGING CONFIGURATION ---
 ENABLE_CSV_LOG = True
 CSV_LOG_DIR = os.path.expanduser("~/Adaptive_Perception_Project/experiments/logs")
-
 
 class MainPerceptionNode(Node):
     def __init__(self):
@@ -110,6 +127,16 @@ class MainPerceptionNode(Node):
             self.get_logger().info(f"Logging experiment to: {self.csv_path}")
 
         self.get_logger().info("Adaptive Perception Pipeline: Enhanced System Telemetry Active.")
+        if FORCED_ROI is None and FORCED_SCALE is None:
+            self.get_logger().info("DIAGNOSTIC OVERRIDE: normal adaptive behavior")
+        else:
+            roi_override = FORCED_ROI if FORCED_ROI is not None else "adaptive"
+            scale_override = (
+                f"{FORCED_SCALE}x" if FORCED_SCALE is not None else "adaptive"
+            )
+            self.get_logger().info(
+                f"DIAGNOSTIC OVERRIDE: ROI={roi_override}, SCALE={scale_override}"
+            )
 
     def camera_info_callback(self, msg: CameraInfo):
         if self.camera_matrix is None:
@@ -157,12 +184,15 @@ class MainPerceptionNode(Node):
         input_image = cv_img
         img_h, img_w = cv_img.shape[:2]
 
-        mode_used = self.controller.mode
         alpha_used = self.roi_manager.alpha
-        scale_used = self.controller.scale_factor
+        scale = FORCED_SCALE if FORCED_SCALE is not None else self.controller.scale_factor
+        scale_used = scale
         subpix_used = False
         self.profiler.start_stage('roi_compute')
-        if self.controller.mode == "ROI" and self.last_corners is not None:
+        if (
+            (FORCED_ROI is True or (FORCED_ROI is None and self.controller.mode == "ROI"))
+            and self.last_corners is not None
+        ):
             current_roi = self.roi_manager.compute_roi(self.last_corners, cv_img.shape)
         self.profiler.stop_stage('roi_compute')
         if current_roi is not None:
@@ -176,6 +206,7 @@ class MainPerceptionNode(Node):
             roi_y_used = int(ry1)
             roi_width_used = int(rx2 - rx1)
             roi_height_used = int(ry2 - ry1)
+            mode_used = "ROI"
         else:
             roi_x_used = 0
             roi_y_used = 0
@@ -183,8 +214,12 @@ class MainPerceptionNode(Node):
             roi_height_used = int(img_h)
             mode_used = "FULL_IMAGE"
 
+        # Structural guard: prevent pathological FULL_IMAGE @ reduced scale
+        if mode_used == "FULL_IMAGE" and FORCED_SCALE is None:
+            scale = 1.0
+            scale_used = 1.0
+
         # 2. Stage 2: Adaptive Processing Scale Resampling
-        scale = self.controller.scale_factor
         if scale != 1.0:
             self.profiler.start_stage('resize')
             h, w = input_image.shape[:2]
@@ -269,10 +304,11 @@ class MainPerceptionNode(Node):
         )
         self.profiler.start_stage('controller')
         control_state = self.controller.update(
-            detection_success=success, 
-            corners=primary_corners, 
-            confidence=confidence, 
-            latency_ms=self.last_latency_ms
+            detection_success=success,
+            corners=primary_corners,
+            confidence=confidence,
+            latency_ms=self.last_latency_ms,
+            marker_size_px=marker_size_px
         )
         self.profiler.stop_stage('controller')
         self.roi_manager.alpha = control_state["alpha"]
@@ -290,13 +326,13 @@ class MainPerceptionNode(Node):
             self.adaptive_loss_reset_active = False
 
         # Track Mode Switch for telemetry
-        roi_switch = 1 if control_state["mode"] != self.previous_mode else 0
         self.previous_mode = control_state["mode"]
 
         if success and confidence >= self.controller.min_confidence:
             self.last_corners = primary_corners
-        else:
+        elif control_state["mode"] == "FULL_IMAGE":
             self.last_corners = None
+        # In ROI mode during a temporary miss (miss_count < 3), self.last_corners is retained.
 
         # 7. Pose Estimation
         pose_success = False
@@ -308,12 +344,25 @@ class MainPerceptionNode(Node):
             )
         self.profiler.stop_stage('pose')
 
-        if pose_success and quat is not None:
+        quat_flat = None
+        if pose_success:
+            try:
+                quat_flat = np.asarray(quat, dtype=np.float64).reshape(-1)
+            except (TypeError, ValueError):
+                pose_success = False
+            else:
+                if (
+                    quat_flat.size < 4
+                    or not np.all(np.isfinite(quat_flat[:4]))
+                    or np.linalg.norm(quat_flat[:4]) <= 1e-8
+                ):
+                    pose_success = False
+
+        if pose_success and tvec is not None:
             pose_msg = PoseStamped()
             pose_msg.header = msg.header
 
             tvec_flat = np.array(tvec, dtype=np.float64).flatten()
-            quat_flat = np.array(quat, dtype=np.float64).flatten()
 
             pose_msg.pose.position.x = tvec_flat[0]
             pose_msg.pose.position.y = tvec_flat[1]
@@ -341,9 +390,8 @@ class MainPerceptionNode(Node):
         pose_x_m = pose_y_m = pose_z_m = -1.0
         pose_roll_deg = pose_pitch_deg = pose_yaw_deg = -1.0
         pose_distance_m = -1.0
-        if pose_success and tvec is not None and quat is not None:
+        if pose_success and tvec is not None:
             tvec_flat = np.asarray(tvec, dtype=np.float64).reshape(-1)
-            quat_flat = np.asarray(quat, dtype=np.float64).reshape(-1)
             if tvec_flat.size >= 3 and quat_flat.size >= 4:
                 pose_x_m, pose_y_m, pose_z_m = (float(value) for value in tvec_flat[:3])
                 # SciPy lowercase 'xyz': extrinsic rotations about fixed X, Y, Z.
@@ -361,8 +409,9 @@ class MainPerceptionNode(Node):
         lat_msg = Float32(data=latency_ms)
         self.pub_latency.publish(lat_msg)
 
+        display_scale = FORCED_SCALE if FORCED_SCALE is not None else control_state['scale']
         status_str = (f"Mode: {control_state['mode']} | Alpha: {control_state['alpha']:.2f} | "
-                      f"Scale: {control_state['scale']}x | Subpix: {control_state['subpix']} | "
+                      f"Scale: {display_scale}x | Subpix: {control_state['subpix']} | "
                       f"Streak: {control_state['streak']} | Latency: {latency_ms:.2f}ms")
         self.pub_status.publish(String(data=status_str))
 
@@ -443,7 +492,7 @@ class MainPerceptionNode(Node):
         if current_roi is not None:
             x1, y1, x2, y2 = current_roi
             cv2.rectangle(debug_img, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            cv2.putText(debug_img, f"ROI ({control_state['scale']}x, subpix={control_state['subpix']})", 
+            cv2.putText(debug_img, f"ROI ({display_scale}x, subpix={control_state['subpix']})",
                         (x1, max(15, y1 - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
 
         debug_img = self.detector_module.draw(
