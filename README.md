@@ -53,31 +53,59 @@ Evaluated across **144 independent real-world camera trials** (~189.5k frames) a
 
 ---
 
-## Quickstart
+## Quickstart & Execution
 
-### 1. Build within a ROS 2 Workspace
+The perception node processes standard ROS 2 camera streams on `/camera/image_raw` and `/camera/camera_info`, publishing 6-DOF target pose on `/adaptive_perception/pose`.
 
-```bash
-cd ~/ros2_ws/src
-colcon build --packages-select adaptive_perception --symlink-install
-source ~/ros2_ws/install/setup.bash
-```
-
-### 2. Run SCAA Perception Node
+### 1. Prerequisites & Dependencies
 
 ```bash
-# Launch SCAA adaptive tracking with USB camera index 2
-ros2 run adaptive_perception main --cam 2
+sudo apt update && sudo apt install -y \
+  ros-humble-cv-bridge \
+  ros-humble-v4l2-camera \
+  ros-humble-image-transport \
+  python3-opencv python3-scipy python3-psutil
 ```
 
-### 3. Run Baselines for Comparison
+### 2. Launch Camera Stream (USB Webcam)
+
+In a separate terminal, publish your local webcam feed:
+```bash
+ros2 run v4l2_camera v4l2_camera_node --ros-args -p video_device:="/dev/video0"
+```
+
+### 3. Run SCAA Perception Node
+
+Run the adaptive perception tracking controller:
+```bash
+# Direct Python execution
+python3 main.py
+
+# Or via ROS 2 run (within your workspace)
+ros2 run adaptive_perception main
+```
+
+### 4. Run Baseline Comparators
 
 ```bash
 # Full-Frame Baseline (FFB)
-ros2 run adaptive_perception baseline_main --cam 2 --mode baseline
+python3 baseline_main.py --mode baseline
 
 # Kalman ROI Tracker (KRT)
-ros2 run adaptive_perception baseline_main --cam 2 --mode kalman
+python3 baseline_main.py --mode kalman
+```
+
+### 5. Monitor Output
+
+```bash
+# View estimated 6-DOF marker pose
+ros2 topic echo /adaptive_perception/pose
+
+# View perception latency telemetry (ms)
+ros2 topic echo /adaptive_perception/latency_ms
+
+# View visual tracking debug stream (annotated ROI and bounding box)
+ros2 run rqt_image_view rqt_image_view /adaptive_perception/debug_image
 ```
 
 ---
